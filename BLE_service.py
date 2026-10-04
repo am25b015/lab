@@ -1,16 +1,38 @@
 import asyncio
 from enum import Enum
+
 from bleak import BleakScanner, BleakClient
 
-#SERVICE_UUID = 
+
+# ============================================================
+# BLE CONFIGURATION
+# ============================================================
+
 SENSOR_CHARACTERISTIC_UUID = ""
 
+
+# ============================================================
+# CONNECTION STATES
+# ============================================================
+
 class ConnectionState(Enum):
-    Disconnected = "Disconnected"
-    Scanning = "Scanning"
-    Connecting = "Connecting"
-    Connected = "Connected"
-    Reconnecting = "Reconnecting"
+    DISCONNECTED = "Disconnected"
+    SCANNING = "Scanning"
+    CONNECTING = "Connecting"
+    CONNECTED = "Connected"
+    RECONNECTING = "Reconnecting"
+
+
+# ============================================================
+# BLE SERVICE
+# Handles ONLY:
+# - scanning
+# - connecting
+# - disconnecting
+# - subscribing to notifications
+# - reconnecting
+# - forwarding raw BLE data
+# ============================================================
 
 class BLEService:
 
@@ -22,16 +44,24 @@ class BLEService:
         self.client = None
         self.device = None
 
-        self.state = ConnectionState.Disconnected
+        self.state = ConnectionState.DISCONNECTED
 
         self.reconnect_task = None
         self.manual_disconnect = False
 
+        # Stores:
+        # characteristic UUID -> callback
+        #
+        # This allows us to restore subscriptions after reconnecting.
         self.subscriptions = {}
+
+    # ========================================================
+    # SCAN
+    # ========================================================
 
     async def scan(self, timeout=5):
 
-        self.state = ConnectionState.Scanning
+        self.state = ConnectionState.SCANNING
 
         print("Scanning for BLE devices...")
 
@@ -39,45 +69,43 @@ class BLEService:
 
         for device in devices:
 
-            print(
-                f"Found: {device.name} "
-                f"({device.address})"
-            )
+            print(f"Found: {device.name} ({device.address})")
 
+            # Match by address if provided
             if self.address:
 
                 if device.address.lower() == self.address.lower():
 
                     self.device = device
 
-                    print(
-                        f"Selected device: "
-                        f"{device.name}"
-                    )
+                    print(f"Selected device: {device.name}")
 
                     return device
 
+            # Otherwise match by device name
             if self.device_name:
 
                 if device.name == self.device_name:
 
                     self.device = device
 
-                    print(
-                        f"Selected device: "
-                        f"{device.name}"
-                    )
+                    print(f"Selected device: {device.name}")
 
                     return device
 
-        self.state = ConnectionState.Disconnected
+        self.state = ConnectionState.DISCONNECTED
 
         print("Device not found.")
 
         return None
 
+    # ========================================================
+    # CONNECT
+    # ========================================================
+
     async def connect(self):
 
+        # Find device if we don't already have one
         if self.device is None:
 
             await self.scan()
@@ -86,14 +114,10 @@ class BLEService:
 
             raise RuntimeError("No BLE device selected")
 
-        self.state = ConnectionState.Connecting
-
+        self.state = ConnectionState.CONNECTING
         self.manual_disconnect = False
 
-        print(
-            f"Connecting to "
-            f"{self.device.name}..."
-        )
+        print(f"Connecting to {self.device.name}...")
 
         self.client = BleakClient(
             self.device,
@@ -102,11 +126,14 @@ class BLEService:
 
         try:
 
-            await asyncio.wait_for(self.client.connect(), timeout=10)
+            await asyncio.wait_for(
+                self.client.connect(),
+                timeout=10
+            )
 
-        except asyncio.TimeoutError as e:
+        except asyncio.TimeoutError:
 
-            self.state = ConnectionState.Disconnected
+            self.state = ConnectionState.DISCONNECTED
 
             print("Connection timed out")
 
@@ -114,7 +141,7 @@ class BLEService:
 
         except Exception as e:
 
-            self.state = ConnectionState.Disconnected
+            self.state = ConnectionState.DISCONNECTED
 
             print(f"Connection failed: {e}")
 
@@ -122,28 +149,67 @@ class BLEService:
 
         if self.client.is_connected:
 
-            self.state = ConnectionState.Connected
+            self.state = ConnectionState.CONNECTED
 
             print("Connected!")
+
+    # ========================================================
+    # SUBSCRIBE TO BLE NOTIFICATIONS
+    #
+    # This does NOT interpret the data.
+    #
+    # The callback receives:
+    #
+    #     sender
+    #     raw bytes
+    #
+    # What those bytes mean is handled somewhere else.
+    # ========================================================
+
+    async def subscribe(self, characteristic_uuid, callback):
+
+        if self.client is None:
+
+            raise RuntimeError("BLE client does not exist")
+
+        if not self.client.is_connected:
+
+            raise RuntimeError("BLE device is not connected")
+
+        # Remember subscription so it can be restored
+        # after reconnecting.
+        self.subscriptions[characteristic_uuid] = callback
+
+        await self.client.start_notify(
+            characteristic_uuid,
+            callback
+        )
+
+        print(f"Subscribed to: {characteristic_uuid}")
+
+    # ========================================================
+    # DISCONNECT
+    # ========================================================
 
     async def disconnect(self):
 
         self.manual_disconnect = True
 
-        if self.reconnect_task and not self.reconnect_task.done():
+        # Stop any reconnect task
+        if self.reconnect_task:
 
-            self.reconnect_task.cancel()
+            if not self.reconnect_task.done():
 
-            try:
+                self.reconnect_task.cancel()
 
-                await self.reconnect_task
-
-            except (asyncio.CancelledError, Exception):
-
-                pass
+                try:
+                    await self.reconnect_task
+                except asyncio.CancelledError:
+                    pass
 
             self.reconnect_task = None
 
+        # Disconnect BLE client
         if self.client:
 
             if self.client.is_connected:
@@ -152,64 +218,47 @@ class BLEService:
 
                 await self.client.disconnect()
 
-        self.state = ConnectionState.Disconnected
+        self.state = ConnectionState.DISCONNECTED
 
         print("Disconnected")
 
-    async def subscribe(
-        self,
-        characteristic_uuid,
-        callback
-    ):
-
-        if not self.client:
-
-            raise RuntimeError("BLE client does not exist")
-
-        if not self.client.is_connected:
-
-            raise RuntimeError("BLE device is not connected")
-
-        self.subscriptions[characteristic_uuid] = callback
-
-        await self.client.start_notify(
-            characteristic_uuid,
-            callback
-        )
-
-        print(
-            f"Subscribed to: "
-            f"{characteristic_uuid}"
-        )
+    # ========================================================
+    # HANDLE UNEXPECTED DISCONNECT
+    # ========================================================
 
     def _on_disconnect(self, client):
 
         print("\nESP32 disconnected!")
 
-        self.state = ConnectionState.Disconnected
+        self.state = ConnectionState.DISCONNECTED
 
+        # If we intentionally disconnected, do nothing.
         if self.manual_disconnect:
+
             return
 
+        # Start reconnection in the background.
         if self.reconnect_task is None:
 
             try:
 
                 loop = asyncio.get_running_loop()
 
-                self.reconnect_task = loop.create_task(self.reconnect())
+                self.reconnect_task = loop.create_task(
+                    self.reconnect()
+                )
 
             except RuntimeError:
 
                 print("Cannot start reconnect task")
 
-    async def reconnect(
-        self,
-        retries=5,
-        delay=3
-    ):
+    # ========================================================
+    # RECONNECT
+    # ========================================================
 
-        self.state = ConnectionState.Reconnecting
+    async def reconnect(self, retries=5, delay=3):
+
+        self.state = ConnectionState.RECONNECTING
 
         for attempt in range(retries):
 
@@ -224,11 +273,12 @@ class BLEService:
 
             try:
 
+                # Rediscover device if necessary
                 if self.device is None:
 
                     await self.scan()
 
-                    self.state = ConnectionState.Reconnecting
+                    self.state = ConnectionState.RECONNECTING
 
                 if self.device is None:
 
@@ -236,6 +286,7 @@ class BLEService:
 
                     continue
 
+                # Create a new BLE client
                 self.client = BleakClient(
                     self.device,
                     disconnected_callback=self._on_disconnect
@@ -245,10 +296,11 @@ class BLEService:
 
                 if self.client.is_connected:
 
-                    self.state = ConnectionState.Connected
+                    self.state = ConnectionState.CONNECTED
 
                     print("Reconnected!")
 
+                    # Restore all previous subscriptions
                     for uuid, callback in self.subscriptions.items():
 
                         try:
@@ -258,16 +310,13 @@ class BLEService:
                                 callback
                             )
 
-                            print(
-                                f"Resubscribed: "
-                                f"{uuid}"
-                            )
+                            print(f"Resubscribed: {uuid}")
 
                         except Exception as e:
 
                             print(
-                                f"Subscription failed: "
-                                f"{e}"
+                                f"Failed to resubscribe "
+                                f"{uuid}: {e}"
                             )
 
                     self.reconnect_task = None
@@ -280,7 +329,7 @@ class BLEService:
 
             await asyncio.sleep(delay)
 
-        self.state = ConnectionState.Disconnected
+        self.state = ConnectionState.DISCONNECTED
 
         self.reconnect_task = None
 
@@ -288,60 +337,39 @@ class BLEService:
 
         return False
 
+    # ========================================================
+    # GET CURRENT CONNECTION STATE
+    # ========================================================
+
     def get_state(self):
 
         return self.state.value
 
 
-def sensor_callback(sender, data):
+# ============================================================
+# EXAMPLE RAW DATA CALLBACK
+#
+# This deliberately does NOTHING with the data.
+# It only demonstrates that BLE data arrived.
+#
+# Later, main.py can replace this with:
+#
+#     raw bytes -> decoder -> Pydantic -> Supabase
+# ============================================================
 
-    try:
+def handle_ble_data(sender, data):
 
-        message = data.decode("utf-8").strip()
+    print(
+        f"Received {len(data)} bytes "
+        f"from {sender}"
+    )
 
-        print(f"\nReceived: {message}")
+    print(f"Raw data: {data}")
 
-        # Expected example:
-        #
-        # HR,SpO2,LoadG,LoadB
 
-        values = message.split(",")
-
-        if len(values) != 4:
-
-            print(
-                "Invalid packet:"
-                f" expected 4 values, "
-                f"received {len(values)}"
-            )
-
-            return
-
-        heart_rate = float(values[0])
-        spo2 = float(values[1])
-        load_g = float(values[2])
-        load_b = float(values[3])
-
-        print(f"Heart Rate : {heart_rate:.1f} bpm")
-
-        print(f"SpO2       : {spo2:.1f} %")
-
-        print(f"LoadG      : {load_g:.2f} %")
-
-        print(f"LoadB      : {load_b:.2f} %")
-
-    except UnicodeDecodeError:
-
-        print("Received non-text BLE data")
-
-    except ValueError:
-
-        print(f"Invalid sensor values: {data}")
-
-    except Exception as e:
-
-        print(f"Packet processing error: {e}")
-
+# ============================================================
+# TEST / STANDALONE RUNNER
+# ============================================================
 
 async def main():
 
@@ -355,12 +383,12 @@ async def main():
 
         await ble.subscribe(
             SENSOR_CHARACTERISTIC_UUID,
-            sensor_callback
+            handle_ble_data
         )
 
         print("\n--------------------------------")
-        print("Walkabit BLE is running")
-        print("Waiting for sensor data...")
+        print("Walkabit BLE service is running")
+        print("Waiting for BLE data...")
         print("Press Ctrl+C to stop")
         print("--------------------------------")
 
@@ -370,7 +398,7 @@ async def main():
 
     except KeyboardInterrupt:
 
-        print("\nStopping Walkabit BLE...")
+        print("\nStopping BLE service...")
 
     except Exception as e:
 
